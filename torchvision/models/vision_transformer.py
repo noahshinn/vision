@@ -1,7 +1,7 @@
 import math
 from collections import OrderedDict
 from functools import partial
-from typing import Any, Callable, Dict, List, NamedTuple, Optional
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -26,7 +26,10 @@ __all__ = [
     "vit_l_16",
     "vit_l_32",
     "vit_h_14",
+    "SUPPORTED_ACTIVATIONS"
 ]
+
+SUPPORTED_ACTIVATIONS = ["relu", "gelu", "silu", "leaky_relu", "elu"]
 
 
 class ConvStemConfig(NamedTuple):
@@ -42,8 +45,14 @@ class MLPBlock(MLP):
 
     _version = 2
 
-    def __init__(self, in_dim: int, mlp_dim: int, dropout: float):
-        super().__init__(in_dim, [mlp_dim, in_dim], activation_layer=nn.GELU, inplace=None, dropout=dropout)
+    def __init__(
+        self,
+        in_dim: int,
+        mlp_dim: int,
+        dropout: float,
+        activation_layer: Callable[..., torch.nn.Module]
+    ) -> None:
+        super().__init__(in_dim, [mlp_dim, in_dim], activation_layer=activation_layer, inplace=None, dropout=dropout)
 
         for m in self.modules():
             if isinstance(m, nn.Linear):
@@ -94,6 +103,7 @@ class EncoderBlock(nn.Module):
         dropout: float,
         attention_dropout: float,
         norm_layer: Callable[..., torch.nn.Module] = partial(nn.LayerNorm, eps=1e-6),
+        activation_layer: Callable[..., torch.nn.Module] = nn.GELU,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -105,7 +115,7 @@ class EncoderBlock(nn.Module):
 
         # MLP block
         self.ln_2 = norm_layer(hidden_dim)
-        self.mlp = MLPBlock(hidden_dim, mlp_dim, dropout)
+        self.mlp = MLPBlock(hidden_dim, mlp_dim, dropout, activation_layer=activation_layer)
 
     def forward(self, input: torch.Tensor):
         torch._assert(input.dim() == 3, f"Expected (batch_size, seq_length, hidden_dim) got {input.shape}")
@@ -132,6 +142,7 @@ class Encoder(nn.Module):
         dropout: float,
         attention_dropout: float,
         norm_layer: Callable[..., torch.nn.Module] = partial(nn.LayerNorm, eps=1e-6),
+        activation_layer: Callable[..., torch.nn.Module] = nn.GELU,
     ):
         super().__init__()
         # Note that batch_size is on the first dim because
@@ -147,6 +158,7 @@ class Encoder(nn.Module):
                 dropout,
                 attention_dropout,
                 norm_layer,
+                activation_layer=activation_layer,
             )
         self.layers = nn.Sequential(layers)
         self.ln = norm_layer(hidden_dim)
@@ -174,6 +186,7 @@ class VisionTransformer(nn.Module):
         representation_size: Optional[int] = None,
         norm_layer: Callable[..., torch.nn.Module] = partial(nn.LayerNorm, eps=1e-6),
         conv_stem_configs: Optional[List[ConvStemConfig]] = None,
+        activation: Union[str, Callable[..., torch.nn.Module]] = "gelu",
     ):
         super().__init__()
         _log_api_usage_once(self)
@@ -220,6 +233,25 @@ class VisionTransformer(nn.Module):
         self.class_token = nn.Parameter(torch.zeros(1, 1, hidden_dim))
         seq_length += 1
 
+        if isinstance(activation, str):
+            activation = activation.lower()
+            if activation == "relu":
+                activation_layer = nn.ReLU
+            elif activation == "gelu":
+                activation_layer = nn.GELU
+            elif activation == "silu":
+                activation_layer = nn.SiLU
+            elif activation == "leaky_relu":
+                activation_layer = nn.LeakyReLU
+            elif activation == "elu":
+                activation_layer = nn.ELU
+            else:
+                raise ValueError(f"Unsupported activation: {activation}, expected one of {SUPPORTED_ACTIVATIONS}")
+        elif isinstance(activation, nn.Module):
+            activation_layer = activation
+        else:
+            raise ValueError(f"Unsupported activation type: {type(activation)}")
+
         self.encoder = Encoder(
             seq_length,
             num_layers,
@@ -229,6 +261,7 @@ class VisionTransformer(nn.Module):
             dropout,
             attention_dropout,
             norm_layer,
+            activation_layer=activation_layer,
         )
         self.seq_length = seq_length
 
